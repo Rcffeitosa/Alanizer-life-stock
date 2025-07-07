@@ -46,152 +46,85 @@ def process_data(status_file, rastreabilidade_file, estoque_file):
     try:
         # 1. Processar o arquivo de Status da Ordem
         df_status = read_file(status_file)
-        if df_status is None:
-            return None # A mensagem de erro já foi exibida na função read_file
+        if df_status is None: return None
 
-
-
-        # --- Validação das Colunas Essenciais ---
-        # Agora, verifica se as colunas padronizadas existem
         required_cols = ['Item', 'Descrição', 'Quantidade Não Alocada']
-        missing_cols = [col for col in required_cols if col not in df_status.columns]
-
-        if missing_cols:
-            st.error(f"Erro ao processar o arquivo de status. Coluna(s) essencial(is) não encontrada(s): {missing_cols}.")
-            st.info(f"Colunas disponíveis no arquivo (após tentativa de adaptação): {list(df_status.columns)}")
+        if not all(col in df_status.columns for col in required_cols):
+            missing = [col for col in required_cols if col not in df_status.columns]
+            st.error(f"Erro no arquivo de status: Coluna(s) não encontrada(s): {missing}.")
             return None
 
         df_status_processed = df_status[required_cols].copy()
+        df_status_processed['Quantidade Não Alocada'] = pd.to_numeric(df_status_processed['Quantidade Não Alocada'], errors='coerce').fillna(0)
+        df_status_processed = df_status_processed[df_status_processed['Quantidade Não Alocada'] > 0].copy()
+        
+        # Otimização: Obter lista de itens de interesse para filtrar as outras planilhas
+        itens_de_interesse = df_status_processed['Item'].unique()
 
-        # Filtrar para remover itens com 'Quantidade Não Alocada' igual a 0
-        df_status_processed = df_status_processed[df_status_processed['Quantidade Não Alocada'] != 0].copy()
-
-        # 2. Processar Consulta_Rastreabilidade.xlsx
+        # 2. Processar Rastreabilidade para obter endereços 'A0'
         df_rastreabilidade = read_file(rastreabilidade_file)
-        if df_rastreabilidade is None:
-            return None
-
-        # Como read_file já padronizou, podemos decidir a estratégia com segurança
+        if df_rastreabilidade is None: return None
+        
         if 'Endereço' in df_rastreabilidade.columns:
-            # Estratégia 1: Usar a coluna 'Endereço' diretamente
-            df_melted = df_rastreabilidade[['Item', 'Endereço']].copy()
+            df_rast_enderecos = df_rastreabilidade[['Item', 'Endereço']]
         elif 'Endereço Origem' in df_rastreabilidade.columns and 'Endereço Destino' in df_rastreabilidade.columns:
-            # Estratégia 2: Combinar 'Origem' e 'Destino'
-            df_melted = df_rastreabilidade.melt(
-                id_vars=['Item'],
-                value_vars=['Endereço Origem', 'Endereço Destino'],
-                value_name='Endereço'
-            )
+            df_rast_enderecos = df_rastreabilidade.melt(id_vars=['Item'], value_vars=['Endereço Origem', 'Endereço Destino'], value_name='Endereço')[['Item', 'Endereço']]
         else:
-            st.error("Erro Crítico no arquivo de Rastreabilidade: Nenhuma coluna de endereço válida encontrada.")
-            st.info("O arquivo deve conter ou uma coluna 'Endereço', ou as colunas 'Endereço Origem' e 'Endereço Destino'.")
-            st.info(f"Colunas encontradas (já padronizadas): {list(df_rastreabilidade.columns)}")
-            return None
+            df_rast_enderecos = pd.DataFrame(columns=['Item', 'Endereço']) # Continua com dataframe vazio se não achar
 
-        # Limpeza e filtragem otimizada
-        df_filtered = df_melted.dropna(subset=['Endereço'])
-        df_filtered = df_filtered[df_filtered['Endereço'].astype(str).str.startswith('A0')].copy()
-        df_filtered.drop_duplicates(subset=['Item', 'Endereço'], inplace=True)
+        df_rast_enderecos = df_rast_enderecos.dropna(subset=['Endereço'])
+        df_rast_enderecos = df_rast_enderecos[
+            df_rast_enderecos['Item'].isin(itens_de_interesse) &
+            df_rast_enderecos['Endereço'].astype(str).str.startswith('A0')
+        ][['Item', 'Endereço']]
 
-        # Agrupa por Item e cria a lista de endereços da rastreabilidade
-        enderecos_rastreabilidade = (
-            df_filtered.sort_values('Endereço')
-            .groupby('Item', as_index=False)
-            .agg(Enderecos_Rastreabilidade=('Endereço', list))
-        )
-        enderecos_rastreabilidade.rename(
-            columns={'Enderecos_Rastreabilidade': 'Endereços A0 (Rastreabilidade)'},
-            inplace=True
-        )
-
-        # 3. Processar Consulta_de_Estoque.xlsx, mantendo a granularidade
+        # 3. Processar Estoque para obter endereços 'A0' e quantidades
         df_estoque = read_file(estoque_file)
-        if df_estoque is None:
+        if df_estoque is None: return None
+
+        if 'Endereço' not in df_estoque.columns or 'Qtd Atual' not in df_estoque.columns:
+            st.error("Erro no arquivo de Estoque: As colunas 'Endereço' e/ou 'Qtd Atual' não foram encontradas.")
             return None
-
-        # --- Validação da coluna de Endereço no Estoque ---
-        if 'Endereço' not in df_estoque.columns:
-            st.error("Erro Crítico no arquivo de Estoque: A coluna 'Endereço' não foi encontrada.")
-            st.info("O aplicativo tentou padronizar os nomes das colunas, mas não obteve sucesso.")
-            st.info(f"Colunas encontradas no arquivo (após tentativa de limpeza): {list(df_estoque.columns)}")
-            return None
-
-
-
-        # Renomeia 'Qtd Atual' para 'Qtd em Estoque' para clareza
-        if 'Qtd Atual' in df_estoque.columns:
-            df_estoque.rename(columns={'Qtd Atual': 'Qtd em Estoque'}, inplace=True)
-
-        itens_status = df_status_processed['Item'].unique()
-        df_estoque_detalhado = df_estoque[
-            df_estoque['Item'].isin(itens_status) &
-            df_estoque['Endereço'].astype(str).str.startswith('A0', na=False)
+        
+        df_estoque.rename(columns={'Qtd Atual': 'Qtd em Estoque'}, inplace=True)
+        df_estoque['Qtd em Estoque'] = pd.to_numeric(df_estoque['Qtd em Estoque'], errors='coerce').fillna(0)
+        
+        df_estoque_enderecos = df_estoque[
+            df_estoque['Item'].isin(itens_de_interesse) &
+            df_estoque['Endereço'].astype(str).str.startswith('A0')
         ].copy()
         
-        # Garantir que a coluna de quantidade é numérica
-        df_estoque_detalhado['Qtd em Estoque'] = pd.to_numeric(df_estoque_detalhado['Qtd em Estoque'], errors='coerce').fillna(0)
+        df_estoque_enderecos = df_estoque_enderecos.groupby(['Item', 'Endereço'], as_index=False)['Qtd em Estoque'].sum()
 
-        # Agrupar para somar quantidades para o mesmo Item-Endereço
-        df_estoque_detalhado = df_estoque_detalhado.groupby(['Item', 'Endereço'], as_index=False)['Qtd em Estoque'].sum()
+        # 4. Consolidar todos os endereços 'A0' únicos de ambas as fontes
+        todos_enderecos_a0 = pd.concat([
+            df_rast_enderecos[['Item', 'Endereço']],
+            df_estoque_enderecos[['Item', 'Endereço']]
+        ]).drop_duplicates()
 
-        # 4. Unificar dados e construir o relatório
-        df_merged = pd.merge(df_status_processed, enderecos_rastreabilidade, on='Item', how='left')
-
-        # Obter a lista de endereços únicos do estoque para cada item
-        enderecos_estoque = df_estoque_detalhado.groupby('Item')['Endereço'].apply(list).reset_index()
-        enderecos_estoque.rename(columns={'Endereço': 'Endereços A0 (Estoque)'}, inplace=True)
-        df_merged = pd.merge(df_merged, enderecos_estoque, on='Item', how='left')
-
-        # Garantir que as colunas de lista existam e não sejam nulas
-        for col in ['Endereços A0 (Rastreabilidade)', 'Endereços A0 (Estoque)']:
-            df_merged[col] = df_merged[col].apply(lambda d: d if isinstance(d, list) else [])
-
-        # Juntar as duas listas de endereços em uma única, sem duplicatas
-        df_merged['Endereço A0'] = df_merged.apply(
-            lambda row: sorted(list(set(row['Endereços A0 (Rastreabilidade)'] + row['Endereços A0 (Estoque)']))),
-            axis=1
-        )
-
-        # 5. Estruturar o relatório final
-        # Expandir para ter uma linha por endereço
-        df_final = df_merged[['Item', 'Descrição', 'Quantidade Não Alocada', 'Endereço A0']].explode('Endereço A0').reset_index(drop=True)
-
-        # Remover linhas onde 'Endereço A0' ficou nulo (para itens que não tinham nenhum endereço)
-        df_final.dropna(subset=['Endereço A0'], inplace=True)
-
-        # Juntar com as quantidades detalhadas do estoque
-        df_final = pd.merge(
-            df_final,
-            df_estoque_detalhado,
-            left_on=['Item', 'Endereço A0'],
-            right_on=['Item', 'Endereço'],
-            how='left'
-        )
-
-        # Aplicar a lógica do 'Status da Quantidade'
-        df_final['Qtd em Estoque'] = df_final['Qtd em Estoque'].fillna(0)
+        # 5. Construir o relatório final de forma otimizada
+        df_final = pd.merge(df_status_processed, todos_enderecos_a0, on='Item', how='left')
+        df_final = pd.merge(df_final, df_estoque_enderecos, on=['Item', 'Endereço'], how='left')
+        
+        df_final['Endereço'].fillna('Sem Endereço A0 Conhecido', inplace=True)
+        df_final['Qtd em Estoque'].fillna(0, inplace=True)
+        
         df_final['Status da Quantidade'] = np.where(
             df_final['Qtd em Estoque'] > 0,
             df_final['Qtd em Estoque'].astype(int).astype(str),
             'VIDA'
         )
-
-        # Selecionar e reordenar as colunas finais
-        df_final = df_final[[
-            'Item',
-            'Descrição',
-            'Quantidade Não Alocada',
-            'Endereço A0',
-            'Status da Quantidade'
-        ]]
-
-        # Renomear colunas para a exibição final, conforme solicitado
+        
         df_final.rename(columns={
-            'Endereço A0': 'Endereço',
+            'Endereço': 'Endereço',
             'Status da Quantidade': 'Rastreabilidade / Qnt. Atual'
         }, inplace=True)
+        
+        return df_final[['Item', 'Descrição', 'Quantidade Não Alocada', 'Endereço', 'Rastreabilidade / Qnt. Atual']]
 
-        return df_final
+    except Exception as e:
+        st.error(f"Ocorreu um erro durante o processamento: {e}")
+        return None
 
     except Exception as e:
         st.error(f"Ocorreu um erro durante o processamento: {e}")
