@@ -40,6 +40,7 @@ def read_file(uploaded_file):
         st.error(f"Erro ao ler o arquivo {file_name}: {e}")
         return None
 
+@st.cache_data
 def process_data(status_file, rastreabilidade_file, estoque_file):
     """Função principal para processar os três arquivos Excel e gerar o relatório final."""
     try:
