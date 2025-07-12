@@ -1,287 +1,327 @@
-import streamlit as st
 import pandas as pd
-import io
-import numpy as np
+import streamlit as st
+import logging
+from pathlib import Path
+import plotly.express as px
+from datetime import datetime
+import os
 
-# --- Funções de Processamento ---
+# Configuração de logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def read_file(uploaded_file):
-    """Lê, limpa e padroniza os nomes das colunas de um arquivo carregado."""
-    if uploaded_file is None:
-        return None
+class RastreabilidadeProcessor:
+    """Classe para processar dados de rastreabilidade"""
     
-    try:
-        file_name = uploaded_file.name
-        if file_name.endswith('.csv'):
-            df = pd.read_csv(uploaded_file, sep=None, engine='python', dtype=str)
-        elif file_name.endswith(('.xlsx', '.xls')):
-            df = pd.read_excel(uploaded_file, engine='openpyxl', dtype=str)
-        else:
-            st.error(f"Formato de arquivo não suportado: {file_name}. Por favor, use CSV ou XLSX.")
-            return None
-
-        # --- Padronização Robusta de Nomes de Colunas ---
-        # 1. Remove espaços extras. 2. Converte para Title Case. 3. Substitui variações comuns.
-        cols = df.columns.str.strip().str.title()
+    def __init__(self):
+        self.df_rastreabilidade = None
+        self.df_status = None
+        self.df_estoque = None
+        self.df_resultado = None
         
-        replacements = {
-            'Description': 'Descrição',
-            'Descricao': 'Descrição',
-            'Endereco': 'Endereço',
-            'Endereco Origem': 'Endereço Origem',
-            'Endereco Destino': 'Endereço Destino',
-            'Quantidade Nao Alocada': 'Quantidade Não Alocada'
-        }
+    def load_data(self, rastreabilidade_file, status_ordem_file, consulta_estoque_file):
+        """Carrega os dados dos arquivos fornecidos"""
+        try:
+            # Carregar dados com tratamento de erro
+            if rastreabilidade_file.suffix == '.csv':
+                self.df_rastreabilidade = pd.read_csv(rastreabilidade_file)
+            else:
+                self.df_rastreabilidade = pd.read_excel(rastreabilidade_file)
+                
+            self.df_status = pd.read_excel(status_ordem_file)
+            self.df_estoque = pd.read_excel(consulta_estoque_file)
+            
+            logger.info("Dados carregados com sucesso")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Erro ao carregar dados: {str(e)}")
+            return False
+    
+    def process_rastreabilidade(self):
+        """Processa os dados de rastreabilidade"""
+        # Seleção e renomeação de colunas
+        required_columns = ['Item', 'Descrição do Item', 'Endereço Origem', 'Endereço Destino']
         
-        df.columns = [replacements.get(col, col) for col in cols]
+        # Verificar se as colunas existem
+        missing_columns = [col for col in required_columns if col not in self.df_rastreabilidade.columns]
+        if missing_columns:
+            logger.error(f"Colunas faltando em rastreabilidade: {missing_columns}")
+            return False
+            
+        self.df_rastreabilidade = self.df_rastreabilidade[required_columns].copy()
         
-        return df
-    except Exception as e:
-        st.error(f"Erro ao ler o arquivo {file_name}: {e}")
-        return None
-
-def process_data(status_file, rastreabilidade_file, estoque_file):
-    """Função principal para processar os três arquivos Excel e gerar o relatório final."""
-    try:
-        # 1. Processar o arquivo de Status da Ordem
-        df_status = read_file(status_file)
-        if df_status is None:
-            return None # A mensagem de erro já foi exibida na função read_file
-
-
-
-        # --- Validação das Colunas Essenciais ---
-        # Agora, verifica se as colunas padronizadas existem
-        required_cols = ['Item', 'Descrição', 'Quantidade Não Alocada']
-        missing_cols = [col for col in required_cols if col not in df_status.columns]
-
-        if missing_cols:
-            st.error(f"Erro ao processar o arquivo de status. Coluna(s) essencial(is) não encontrada(s): {missing_cols}.")
-            st.info(f"Colunas disponíveis no arquivo (após tentativa de adaptação): {list(df_status.columns)}")
-            return None
-
-        df_status_processed = df_status[required_cols].copy()
-
-        # Filtrar para remover itens com 'Quantidade Não Alocada' igual a 0
-        df_status_processed = df_status_processed[df_status_processed['Quantidade Não Alocada'] != 0].copy()
-
-        # 2. Processar Consulta_Rastreabilidade.xlsx
-        df_rastreabilidade = read_file(rastreabilidade_file)
-        if df_rastreabilidade is None:
-            return None
-
-        # Como read_file já padronizou, podemos decidir a estratégia com segurança
-        if 'Endereço' in df_rastreabilidade.columns:
-            # Estratégia 1: Usar a coluna 'Endereço' diretamente
-            df_melted = df_rastreabilidade[['Item', 'Endereço']].copy()
-        elif 'Endereço Origem' in df_rastreabilidade.columns and 'Endereço Destino' in df_rastreabilidade.columns:
-            # Estratégia 2: Combinar 'Origem' e 'Destino'
-            df_melted = df_rastreabilidade.melt(
-                id_vars=['Item'],
-                value_vars=['Endereço Origem', 'Endereço Destino'],
-                value_name='Endereço'
-            )
-        else:
-            st.error("Erro Crítico no arquivo de Rastreabilidade: Nenhuma coluna de endereço válida encontrada.")
-            st.info("O arquivo deve conter ou uma coluna 'Endereço', ou as colunas 'Endereço Origem' e 'Endereço Destino'.")
-            st.info(f"Colunas encontradas (já padronizadas): {list(df_rastreabilidade.columns)}")
-            return None
-
-        # Limpeza e filtragem otimizada
-        df_filtered = df_melted.dropna(subset=['Endereço'])
-        df_filtered = df_filtered[df_filtered['Endereço'].astype(str).str.startswith('A0')].copy()
-        df_filtered.drop_duplicates(subset=['Item', 'Endereço'], inplace=True)
-
-        # Agrupa por Item e cria a lista de endereços da rastreabilidade
-        enderecos_rastreabilidade = (
-            df_filtered.sort_values('Endereço')
-            .groupby('Item', as_index=False)
-            .agg(Enderecos_Rastreabilidade=('Endereço', list))
+        # Unir endereços
+        self.df_rastreabilidade['Endereço'] = (
+            self.df_rastreabilidade['Endereço Origem'].fillna('') + 
+            self.df_rastreabilidade['Endereço Destino'].fillna('')
         )
-        enderecos_rastreabilidade.rename(
-            columns={'Enderecos_Rastreabilidade': 'Endereços A0 (Rastreabilidade)'},
-            inplace=True
+        
+        # Criar chave1 e remover duplicados
+        self.df_rastreabilidade['Chave1'] = (
+            self.df_rastreabilidade['Item'].astype(str) + 
+            self.df_rastreabilidade['Endereço']
         )
-
-        # 3. Processar Consulta_de_Estoque.xlsx, mantendo a granularidade
-        df_estoque = read_file(estoque_file)
-        if df_estoque is None:
-            return None
-
-        # --- Validação da coluna de Endereço no Estoque ---
-        if 'Endereço' not in df_estoque.columns:
-            st.error("Erro Crítico no arquivo de Estoque: A coluna 'Endereço' não foi encontrada.")
-            st.info("O aplicativo tentou padronizar os nomes das colunas, mas não obteve sucesso.")
-            st.info(f"Colunas encontradas no arquivo (após tentativa de limpeza): {list(df_estoque.columns)}")
-            return None
-
-
-
-        # Renomeia 'Qtd Atual' para 'Qtd em Estoque' para clareza
-        if 'Qtd Atual' in df_estoque.columns:
-            df_estoque.rename(columns={'Qtd Atual': 'Qtd em Estoque'}, inplace=True)
-
-        itens_status = df_status_processed['Item'].unique()
-        df_estoque_detalhado = df_estoque[
-            df_estoque['Item'].isin(itens_status) &
-            df_estoque['Endereço'].astype(str).str.startswith('A0', na=False)
+        self.df_rastreabilidade = self.df_rastreabilidade.drop_duplicates(
+            subset=['Chave1']
+        ).reset_index(drop=True)
+        
+        return True
+    
+    def merge_with_status(self):
+        """Faz o merge com dados de status"""
+        required_status_columns = ['Item', 'Description', 'Quantidade Não Alocada']
+        
+        # Verificar se as colunas existem
+        missing_columns = [col for col in required_status_columns if col not in self.df_status.columns]
+        if missing_columns:
+            logger.error(f"Colunas faltando em status: {missing_columns}")
+            return False
+            
+        df_status_filtered = self.df_status[required_status_columns].copy()
+        
+        self.df_rastreabilidade = self.df_rastreabilidade.merge(
+            df_status_filtered,
+            how='left',
+            on='Item'
+        )
+        
+        self.df_rastreabilidade = self.df_rastreabilidade.rename(columns={
+            'Description': 'Descrição_Status',
+            'Quantidade Não Alocada': 'Não Alocado'
+        })
+        
+        return True
+    
+    def process_estoque(self):
+        """Processa dados de estoque"""
+        required_estoque_columns = ['Item', 'Descrição', 'Endereço', 'Qtd Atual']
+        
+        # Verificar se as colunas existem
+        missing_columns = [col for col in required_estoque_columns if col not in self.df_estoque.columns]
+        if missing_columns:
+            logger.error(f"Colunas faltando em estoque: {missing_columns}")
+            return False
+            
+        self.df_estoque['Endereço'] = self.df_estoque['Endereço'].fillna('')
+        self.df_estoque['Chave2'] = (
+            self.df_estoque['Item'].astype(str) + 
+            self.df_estoque['Endereço']
+        )
+        self.df_estoque = self.df_estoque.drop_duplicates(subset=['Chave2'])
+        
+        # Fazer o PROCV para quantidade endereço
+        estoque_lookup = self.df_estoque.set_index('Chave2')[['Item', 'Descrição', 'Qtd Atual']]
+        
+        def buscar_qnt_endereco(chave):
+            try:
+                return estoque_lookup.loc[chave, 'Qtd Atual']
+            except KeyError:
+                return None
+        
+        self.df_rastreabilidade['Qnt endereço'] = self.df_rastreabilidade['Chave1'].apply(buscar_qnt_endereco)
+        
+        return True
+    
+    def apply_business_rules(self):
+        """Aplica regras de negócio"""
+        # STATUS: se "Não Alocado" estiver nulo, colocar VIDA
+        self.df_rastreabilidade['Status'] = self.df_rastreabilidade['Não Alocado'].apply(
+            lambda x: 'VIDA' if pd.isna(x) else ''
+        )
+        
+        # Qnt endereço: se nulo, deixar vazio
+        self.df_rastreabilidade['Qnt endereço'] = self.df_rastreabilidade['Qnt endereço'].fillna('')
+        
+        # Filtrar somente endereço com 'A0'
+        self.df_resultado = self.df_rastreabilidade[
+            self.df_rastreabilidade['Endereço'].str.startswith('A0', na=False)
         ].copy()
         
-        # Garantir que a coluna de quantidade é numérica
-        df_estoque_detalhado['Qtd em Estoque'] = pd.to_numeric(df_estoque_detalhado['Qtd em Estoque'], errors='coerce').fillna(0)
-
-        # Agrupar para somar quantidades para o mesmo Item-Endereço
-        df_estoque_detalhado = df_estoque_detalhado.groupby(['Item', 'Endereço'], as_index=False)['Qtd em Estoque'].sum()
-
-        # 4. Unificar dados e construir o relatório
-        df_merged = pd.merge(df_status_processed, enderecos_rastreabilidade, on='Item', how='left')
-
-        # Obter a lista de endereços únicos do estoque para cada item
-        enderecos_estoque = df_estoque_detalhado.groupby('Item')['Endereço'].apply(list).reset_index()
-        enderecos_estoque.rename(columns={'Endereço': 'Endereços A0 (Estoque)'}, inplace=True)
-        df_merged = pd.merge(df_merged, enderecos_estoque, on='Item', how='left')
-
-        # Garantir que as colunas de lista existam e não sejam nulas
-        for col in ['Endereços A0 (Rastreabilidade)', 'Endereços A0 (Estoque)']:
-            df_merged[col] = df_merged[col].apply(lambda d: d if isinstance(d, list) else [])
-
-        # Juntar as duas listas de endereços em uma única, sem duplicatas
-        df_merged['Endereço A0'] = df_merged.apply(
-            lambda row: sorted(list(set(row['Endereços A0 (Rastreabilidade)'] + row['Endereços A0 (Estoque)']))),
-            axis=1
-        )
-
-        # 5. Estruturar o relatório final
-        # Expandir para ter uma linha por endereço
-        df_final = df_merged[['Item', 'Descrição', 'Quantidade Não Alocada', 'Endereço A0']].explode('Endereço A0').reset_index(drop=True)
-
-        # Remover linhas onde 'Endereço A0' ficou nulo (para itens que não tinham nenhum endereço)
-        df_final.dropna(subset=['Endereço A0'], inplace=True)
-
-        # Juntar com as quantidades detalhadas do estoque
-        df_final = pd.merge(
-            df_final,
-            df_estoque_detalhado,
-            left_on=['Item', 'Endereço A0'],
-            right_on=['Item', 'Endereço'],
-            how='left'
-        )
-
-        # Aplicar a lógica do 'Status da Quantidade'
-        df_final['Qtd em Estoque'] = df_final['Qtd em Estoque'].fillna(0)
-        df_final['Status da Quantidade'] = np.where(
-            df_final['Qtd em Estoque'] > 0,
-            df_final['Qtd em Estoque'].astype(int).astype(str),
-            'VIDA'
-        )
-
-        # Selecionar e reordenar as colunas finais
-        df_final = df_final[[
+        return True
+    
+    def generate_final_report(self, output_path='Relatorio_Rastreabilidade_Final.xlsx'):
+        """Gera o relatório final"""
+        final_columns = [
             'Item',
-            'Descrição',
-            'Quantidade Não Alocada',
-            'Endereço A0',
-            'Status da Quantidade'
-        ]]
-
-        # Renomear colunas para a exibição final, conforme solicitado
-        df_final.rename(columns={
-            'Endereço A0': 'Endereço',
-            'Status da Quantidade': 'Rastreabilidade / Qnt. Atual'
-        }, inplace=True)
-
-        return df_final
-
-    except Exception as e:
-        st.error(f"Ocorreu um erro durante o processamento: {e}")
-        return None
-
-# --- Funções da Interface ---
-
-def to_excel(df):
-    """Converte um DataFrame para um arquivo Excel em memória."""
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Relatorio')
-    processed_data = output.getvalue()
-    return processed_data
-
-def clear_uploads():
-    """Callback para limpar o estado dos uploaders, incrementando o contador de limpeza."""
-    st.session_state.clear_count += 1
-    if 'final_report' in st.session_state:
-        del st.session_state['final_report']
-
-# --- Interface do Streamlit ---
-
-st.set_page_config(page_title="Rastreabilidade de Estoque", layout="wide")
-
-st.title('✅ Alanizer Life Stock Versão 1.0.0 - By Ricardo Feitosa')
-st.markdown("""
-Esta ferramenta integra dados de três planilhas para gerar um relatório de rastreabilidade
- """)
-
-# Inicializar o contador de limpeza no estado da sessão, se não existir
-if 'clear_count' not in st.session_state:
-    st.session_state.clear_count = 0
-
-# Seção de Upload
-with st.sidebar:
-    st.header('📤 Upload das Planilhas')
-    # Usar chaves dinâmicas baseadas no contador de limpeza para forçar a recriação do widget
-    status_file = st.file_uploader("1. Status_da_Ordem", type=['xlsx', 'csv'], key=f"status_uploader_{st.session_state.clear_count}")
-    rastreabilidade_file = st.file_uploader("2. Consulta_Rastreabilidade", type=['xlsx', 'csv'], key=f"rastreabilidade_uploader_{st.session_state.clear_count}")
-    estoque_file = st.file_uploader("3. Consulta_de_Estoque", type=['xlsx', 'csv'], key=f"estoque_uploader_{st.session_state.clear_count}")
-
-    # Criar colunas para os botões
-    col1, col2 = st.columns(2)
-
-    with col1:
-        gerar_relatorio = st.button('Gerar Relatório', type="primary", use_container_width=True)
-
-    with col2:
-        st.button('Limpar', on_click=clear_uploads, use_container_width=True)
-
-# Lógica principal do relatório
-if gerar_relatorio:
-    if status_file and rastreabilidade_file and estoque_file:
-        with st.spinner('Processando dados... Por favor, aguarde.'):
-            final_report = process_data(status_file, rastreabilidade_file, estoque_file)
+            'Descrição do Item',
+            'Endereço',
+            'Chave1',
+            'Não Alocado',
+            'Qnt endereço',
+            'Status'
+        ]
         
-        if final_report is not None:
-            st.success('Relatório gerado com sucesso!')
-            st.dataframe(final_report)
+        df_resultado_final = self.df_resultado[final_columns]
+        
+        # Salvar resultado
+        df_resultado_final.to_excel(output_path, index=False)
+        logger.info(f"Relatório gerado com sucesso: {output_path}")
+        
+        return df_resultado_final
+    
+    def get_summary_stats(self):
+        """Retorna estatísticas resumidas"""
+        if self.df_resultado is None:
+            return None
             
-            # Armazenar o relatório no estado da sessão para download
-            st.session_state['final_report'] = final_report
-        else:
-            st.error("Não foi possível gerar o relatório. Verifique os arquivos e tente novamente.")
-    else:
-        st.warning('Por favor, faça o upload das três planilhas para continuar.')
-
-# Seção de Download (aparece após gerar o relatório)
-if 'final_report' in st.session_state and not st.session_state['final_report'].empty:
-    st.header('📥 Download do Relatório')
-    report_df = st.session_state['final_report']
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Download em CSV
-        csv = report_df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="Baixar como CSV",
-            data=csv,
-            file_name='relatorio_rastreabilidade.csv',
-            mime='text/csv',
-        )
+        stats = {
+            'total_items': len(self.df_resultado),
+            'items_with_vida_status': len(self.df_resultado[self.df_resultado['Status'] == 'VIDA']),
+            'items_with_quantity': len(self.df_resultado[self.df_resultado['Qnt endereço'] != '']),
+            'unique_addresses': self.df_resultado['Endereço'].nunique()
+        }
         
-    with col2:
-        # Download em XLSX
-        excel_data = to_excel(report_df)
-        st.download_button(
-            label="Baixar como XLSX",
-            data=excel_data,
-            file_name='relatorio_rastreabilidade.xlsx',
-            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        )
+        return stats
+
+def main():
+    """Função principal da aplicação Streamlit"""
+    st.set_page_config(
+        page_title="Processador de Rastreabilidade",
+        page_icon="📊",
+        layout="wide"
+    )
+    
+    st.title("📊 Processador de Rastreabilidade")
+    st.markdown("---")
+    
+    # Sidebar para upload de arquivos
+    st.sidebar.header("Upload de Arquivos")
+    
+    rastreabilidade_file = st.sidebar.file_uploader(
+        "Arquivo de Rastreabilidade",
+        type=['csv', 'xlsx'],
+        help="Arquivo CSV ou Excel com dados de rastreabilidade"
+    )
+    
+    status_ordem_file = st.sidebar.file_uploader(
+        "Arquivo de Status da Ordem",
+        type=['xlsx'],
+        help="Arquivo Excel com dados de status da ordem"
+    )
+    
+    consulta_estoque_file = st.sidebar.file_uploader(
+        "Arquivo de Consulta de Estoque",
+        type=['xlsx'],
+        help="Arquivo Excel com dados de consulta de estoque"
+    )
+    
+    if all([rastreabilidade_file, status_ordem_file, consulta_estoque_file]):
+        # Inicializar processador
+        processor = RastreabilidadeProcessor()
+        
+        # Salvar arquivos temporariamente
+        temp_files = []
+        for file, name in [(rastreabilidade_file, "rastreabilidade"), 
+                          (status_ordem_file, "status"), 
+                          (consulta_estoque_file, "estoque")]:
+            temp_path = Path(f"temp_{name}.{file.name.split('.')[-1]}")
+            with open(temp_path, "wb") as f:
+                f.write(file.getbuffer())
+            temp_files.append(temp_path)
+        
+        try:
+            # Processar dados
+            with st.spinner("Processando dados..."):
+                if processor.load_data(temp_files[0], temp_files[1], temp_files[2]):
+                    if (processor.process_rastreabilidade() and
+                        processor.merge_with_status() and
+                        processor.process_estoque() and
+                        processor.apply_business_rules()):
+                        
+                        # Gerar relatório
+                        output_path = f"Relatorio_Rastreabilidade_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                        df_final = processor.generate_final_report(output_path)
+                        
+                        # Mostrar estatísticas
+                        st.success("✅ Processamento concluído com sucesso!")
+                        
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            st.subheader("📈 Estatísticas")
+                            stats = processor.get_summary_stats()
+                            if stats:
+                                st.metric("Total de Items", stats['total_items'])
+                                st.metric("Items com Status VIDA", stats['items_with_vida_status'])
+                                st.metric("Items com Quantidade", stats['items_with_quantity'])
+                                st.metric("Endereços Únicos", stats['unique_addresses'])
+                        
+                        with col2:
+                            st.subheader("📊 Distribuição por Status")
+                            status_counts = df_final['Status'].value_counts()
+                            fig = px.pie(
+                                values=status_counts.values,
+                                names=status_counts.index,
+                                title="Distribuição de Status"
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Mostrar preview dos dados
+                        st.subheader("👀 Preview dos Dados")
+                        st.dataframe(df_final.head(10))
+                        
+                        # Download do arquivo
+                        with open(output_path, "rb") as file:
+                            st.download_button(
+                                label="📥 Download do Relatório",
+                                data=file.read(),
+                                file_name=output_path,
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            )
+                    else:
+                        st.error("❌ Erro durante o processamento dos dados")
+                else:
+                    st.error("❌ Erro ao carregar os dados")
+        
+        except Exception as e:
+            st.error(f"❌ Erro inesperado: {str(e)}")
+        
+        finally:
+            # Limpar arquivos temporários
+            for temp_file in temp_files:
+                if temp_file.exists():
+                    temp_file.unlink()
+    
+    else:
+        st.info("📁 Por favor, faça o upload dos três arquivos necessários na barra lateral.")
+        
+        # Mostrar informações sobre os arquivos esperados
+        st.subheader("📋 Arquivos Necessários")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.info("""
+            **Arquivo de Rastreabilidade**
+            - Formato: CSV ou Excel
+            - Colunas necessárias:
+              - Item
+              - Descrição do Item
+              - Endereço Origem
+              - Endereço Destino
+            """)
+        
+        with col2:
+            st.info("""
+            **Arquivo de Status da Ordem**
+            - Formato: Excel
+            - Colunas necessárias:
+              - Item
+              - Description
+              - Quantidade Não Alocada
+            """)
+        
+        with col3:
+            st.info("""
+            **Arquivo de Consulta de Estoque**
+            - Formato: Excel
+            - Colunas necessárias:
+              - Item
+              - Descrição
+              - Endereço
+              - Qtd Atual
+            """)
+
+if __name__ == "__main__":
+    main()
